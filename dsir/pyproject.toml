@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsir"
+version = "0.1.0"
+description = "DSIR (Data Selection via Importance Resampling) — top-K deterministic variant for NeurIPS 2026 §5.2 baseline"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "mmh3>=4.0,<5",
+    "numpy>=1.24",
+    "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["dsir*"]
+exclude = ["tests*", "examples*", "docs*"]
