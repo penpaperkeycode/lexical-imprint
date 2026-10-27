@@ -1,9 +1,9 @@
-# The Lexical Imprint of Pre-training Data
+<h1 align="center">The Lexical Imprint of Pre-training Data</h1>
 
 <p align="center">
   <a href="https://openreview.net/forum?id=8hN2Bcw0x2"><img src="https://img.shields.io/badge/OpenReview-8hN2Bcw0x2-8c1b13.svg" alt="OpenReview"></a>
   <a href="https://neurips.cc/virtual/2026/loc/sydney/poster/155069"><img src="https://img.shields.io/badge/NeurIPS-2026-4b44ce.svg" alt="NeurIPS 2026"></a>
-  <img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg" alt="arXiv (coming soon)">
+  <a href="https://arxiv.org/abs/2602.10657"><img src="https://img.shields.io/badge/arXiv-2602.10657-b31b1b.svg" alt="arXiv"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
 </p>
 
