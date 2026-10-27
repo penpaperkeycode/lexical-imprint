@@ -126,7 +126,3 @@ The code matches the supplementary package submitted to OpenReview, with one exc
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
-
-## Acknowledgments
-
-This work was partially supported by the Institute for Information & Communications Technology Planning & Evaluation (IITP) grant funded by the Korean government (MSIT) (RS-2019-II190075, Artificial Intelligence Graduate School Program (KAIST), and RS-2022-II220713, Meta-learning Applicable to Real-world Problems).
