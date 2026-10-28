@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Preprocess the 11 evaluation benchmarks used in the paper.
+"""Preprocess the 11 benchmarks of the paper's UCE-filter study.
 
-Downloads each dataset from the HuggingFace Hub (default) and writes one
-parquet file per benchmark, with a single `text` column containing the
-concatenated question + answer-choice text.
+Downloads each dataset from the Hugging Face Hub and writes one parquet file
+per benchmark, with a single `text` column that joins the raw text fields of
+each example (see benchmarks/README.md).
 
 Tasks (paper §5.2):
 
@@ -13,10 +13,10 @@ CSR7 (CE-filter targets):
   - HellaSwag     (Rowan/hellaswag)
   - SciQ          (allenai/sciq)
   - OpenBookQA    (allenai/openbookqa, main)
-  - PIQA          (ybisk/piqa)
+  - PIQA          (ybisk/piqa, Hub parquet conversion refs/convert/parquet)
   - SWAG          (allenai/swag, regular)
 
-OOD reference:
+Out-of-target (OOT-4):
   - LAMBADA       (EleutherAI/lambada_openai)
   - CommonsenseQA (tau/commonsense_qa)
   - BoolQ         (google/boolq)
@@ -24,17 +24,29 @@ OOD reference:
 
 Output (under --output_dir):
   <output_dir>/<task>/<task>.parquet     (per-task parquet)
-  <output_dir>/benchmark_group_en/        (combined directory; CE filter input)
+  <output_dir>/benchmark_group_en/        (combined directory: the tasks
+                                          written by this run)
 
-Each parquet has one `text` column where each row is one example's full text
-(question/context + answer-choice text), ready for unigram-frequency analysis
-or CE-filter benchmark scan.
+Each parquet has one `text` column where each row is one example's text (for
+most tasks the question or context followed by all answer options; SciQ adds
+the support passage, BoolQ is the passage and the question, and LAMBADA is the
+passage), ready for unigram-frequency analysis or CE-filter benchmark scan.
+A directory passed as --bench_path is pooled into one Q, so build the CSR7
+target group (the paper's UCE-filter target) with --tasks and pass its
+benchmark_group_en/. Each run removes task files of earlier runs from
+benchmark_group_en/ and warns about any other file there that --bench_path
+would read.
 
-Usage:
-    python preprocess_csr7.py --output_dir benchmarks/
+Usage (from the repository root):
+    python benchmarks/preprocess_csr7.py --output_dir /data/benchmarks/
 
-Optional: subset of tasks
-    python preprocess_csr7.py --output_dir benchmarks/ --tasks arc_easy,arc_challenge,piqa
+CSR7 target group:
+    python benchmarks/preprocess_csr7.py --output_dir /data/csr7/ \
+        --tasks arc_easy,arc_challenge,hellaswag,sciq,openbookqa,piqa,swag
+
+Exit status: 0 = all tasks written; 1 = at least one task failed, for example
+on a download error or a missing split (the other tasks are still written;
+rerun with the same --tasks); 2 = unknown task name.
 """
 from __future__ import annotations
 
@@ -87,7 +99,7 @@ def proc_arc_easy() -> List[str]:
     rows = []
     for split in ("train", "validation", "test"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             choices = " ".join(ex["choices"]["text"])
             rows.append(sub_punct(f"{ex['question']} {choices}"))
@@ -99,7 +111,7 @@ def proc_arc_challenge() -> List[str]:
     rows = []
     for split in ("train", "validation", "test"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             choices = " ".join(ex["choices"]["text"])
             rows.append(sub_punct(f"{ex['question']} {choices}"))
@@ -111,7 +123,7 @@ def proc_hellaswag() -> List[str]:
     rows = []
     for split in ("train", "validation"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             ctx = ex.get("ctx", "") or ""
             endings = " ".join(ex.get("endings", []))
@@ -124,7 +136,7 @@ def proc_sciq() -> List[str]:
     rows = []
     for split in ("train", "validation", "test"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             choices = " ".join(
                 str(ex.get(k, "") or "")
@@ -140,7 +152,7 @@ def proc_openbookqa() -> List[str]:
     rows = []
     for split in ("train", "validation", "test"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             stem = ex["question_stem"]
             choices = " ".join(ex["choices"]["text"])
@@ -149,11 +161,13 @@ def proc_openbookqa() -> List[str]:
 
 
 def proc_piqa() -> List[str]:
-    ds = load_dataset("ybisk/piqa", trust_remote_code=True)
+    # The main branch of ybisk/piqa holds only a loading script, which datasets
+    # >= 4.0 no longer runs; read the Hub's parquet conversion instead.
+    ds = load_dataset("ybisk/piqa", revision="refs/convert/parquet")
     rows = []
     for split in ("train", "validation", "test"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             rows.append(sub_punct(f"{ex['goal']} {ex['sol1']} {ex['sol2']}"))
     return rows
@@ -164,7 +178,7 @@ def proc_swag() -> List[str]:
     rows = []
     for split in ("train", "validation", "test"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             startphrase = ex.get("startphrase", "") or ""
             endings = " ".join(
@@ -179,7 +193,7 @@ def proc_lambada() -> List[str]:
     rows = []
     for split in ("test",):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             rows.append(sub_punct(ex["text"]))
     return rows
@@ -190,7 +204,7 @@ def proc_commonsense_qa() -> List[str]:
     rows = []
     for split in ("train", "validation"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             choices = " ".join(ex["choices"]["text"])
             rows.append(sub_punct(f"{ex['question']} {choices}"))
@@ -202,7 +216,7 @@ def proc_boolq() -> List[str]:
     rows = []
     for split in ("train", "validation"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             rows.append(sub_punct(f"{ex.get('passage', '')} {ex.get('question', '')}"))
     return rows
@@ -213,7 +227,7 @@ def proc_social_iqa() -> List[str]:
     rows = []
     for split in ("train", "validation"):
         if split not in ds:
-            continue
+            raise ValueError(f"split '{split}' not found; splits present: {list(ds)}")
         for ex in ds[split]:
             ctx = ex.get("context", "") or ""
             q = ex.get("question", "") or ""
@@ -233,7 +247,7 @@ TASK_PROCESSORS: Dict[str, Callable[[], List[str]]] = {
     "openbookqa":     proc_openbookqa,
     "piqa":           proc_piqa,
     "swag":           proc_swag,
-    # OOD reference
+    # Out-of-target (OOT-4)
     "lambada_openai": proc_lambada,
     "commonsense_qa": proc_commonsense_qa,
     "boolq":          proc_boolq,
@@ -249,7 +263,7 @@ def main():
                     help=f"Comma-separated subset; default = all 11. "
                          f"Choices: {','.join(TASK_PROCESSORS.keys())}")
     ap.add_argument("--no_combined", action="store_true",
-                    help="Skip writing the combined benchmark_group_en/ directory")
+                    help="Do not create or touch the combined benchmark_group_en/ directory")
     args = ap.parse_args()
 
     selected = [t.strip() for t in args.tasks.split(",") if t.strip()] or list(TASK_PROCESSORS)
@@ -260,20 +274,53 @@ def main():
 
     print(f"[preprocess] processing {len(selected)} task(s): {selected}", flush=True)
     combined_dir = os.path.join(args.output_dir, "benchmark_group_en")
-    os.makedirs(combined_dir, exist_ok=True)
+    if not args.no_combined:
+        # --bench_path pools every parquet file in the combined directory into one Q,
+        # so it must hold only this run's tasks: remove task files left by earlier
+        # runs (files with other names are left alone).
+        removed = []
+        for task in TASK_PROCESSORS:
+            stale = os.path.join(combined_dir, f"{task}.parquet")
+            if os.path.isfile(stale):
+                os.remove(stale)
+                removed.append(os.path.basename(stale))
+        if removed:
+            print(f"[combined] removed {len(removed)} file(s) of an earlier run from "
+                  f"{combined_dir}: {removed}", flush=True)
 
+    failed = []
     for task in selected:
         print(f"\n[process] {task}", flush=True)
         try:
             rows = TASK_PROCESSORS[task]()
+            if not rows:
+                raise ValueError("no rows (the splits read are empty)")
         except Exception as e:
             print(f"  [FAIL] {task}: {e}", file=sys.stderr)
+            failed.append(task)
             continue
         per_task = out_path(args.output_dir, task)
         save_parquet(rows, per_task)
         if not args.no_combined:
             save_parquet(rows, os.path.join(combined_dir, f"{task}.parquet"))
 
+    if not args.no_combined and os.path.isdir(combined_dir):
+        # Files this run did not write are kept but would also be pooled into Q
+        # (--bench_path skips only names starting with '.' or '_'), so name them.
+        written = {f"{t}.parquet" for t in selected if t not in failed}
+        others = sorted(f for f in os.listdir(combined_dir)
+                        if f not in written and not f.startswith((".", "_")))
+        if others:
+            print(f"\n[warn] {combined_dir} also holds files not written by this run, "
+                  f"and --bench_path pools them too: {others}", file=sys.stderr)
+
+    if failed:
+        hint = "" if args.no_combined else (
+            "; rerun with the same --tasks, since each run replaces benchmark_group_en/")
+        print(f"\n[error] {len(failed)} of {len(selected)} task(s) failed: {failed}; "
+              f"{len(selected) - len(failed)} written under {args.output_dir}{hint}",
+              file=sys.stderr)
+        sys.exit(1)
     print(f"\n[done] outputs at {args.output_dir}", flush=True)
 
 

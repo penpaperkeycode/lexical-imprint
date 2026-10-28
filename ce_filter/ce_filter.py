@@ -1,26 +1,18 @@
-from __future__ import annotations
-
 """
 ce_filter.py  —  Cross-entropy data filtering (120-core optimized version)
 
 Optimization summary:
-  1. Parallel scan: distribute work per parquet fragment; each batch reports progress through a Queue.
+  1. Parallel scan: distribute work per parquet fragment; each batch adds its row and token counts to shared counters.
   2. Analytical ΔH: per-row cost O(unique words); no Counter copy or full-vocab traversal.
   3. Parallel scoring: imap_unordered + worker_batch, leveraging Linux fork zero-copy sharing.
 
-Progress reporting (scan stage):
-  +-- worker processes -------------------------------+
-  |  batch done -> queue.put((n_rows, n_tokens))     |
-  |  fragment done -> queue.put(("FRAG_DONE", 0, 0)) |
-  +---------------------------------------------------+
-           |  mp.Queue()
-           v
-  +-- listener thread (main) -------------------------+
-  |  drain queue -> aggregate -> emit live progress  |
-  +---------------------------------------------------+
+Progress reporting (scan stage): workers add to shared mp.RawValue counters (rows, tokens,
+finished fragments), and a thread in the main process prints them.
 """
+from __future__ import annotations
 
 import argparse
+import json
 import math
 import heapq
 import re
@@ -28,6 +20,7 @@ import unicodedata
 import sys
 import time
 import os
+import shutil
 import tempfile
 import pickle
 import threading
@@ -37,6 +30,28 @@ import multiprocessing as mp
 import pyarrow.dataset as ds
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+# ============================================================
+# Errors
+# ============================================================
+def _fail(msg: str):
+    """Stop the run with a one-line error message and exit code 1."""
+    print(f"[error] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _file_error(path: str, e: Exception) -> str:
+    """One-line description of an error raised while reading `path`."""
+    lines = str(e).strip().splitlines()
+    return f"{path}: {type(e).__name__}: {lines[0] if lines else ''}"
+
+
+def _require_column(dataset, column: str):
+    """Raise if a parquet dataset/file has no `column` (instead of silently reading nothing)."""
+    names = dataset.schema.names
+    if column not in names:
+        raise ValueError(f"no column '{column}' (columns: {', '.join(names)})")
 
 
 # ============================================================
@@ -215,20 +230,19 @@ def get_wet_fragment_paths(path: str) -> list[str]:
 
 
 def iter_wet_texts(wet_path: str, column: str = "text"):
-    """Generator over one .warc.wet.gz file. Yields text for each 'conversion' record."""
+    """Generator over one .warc.wet.gz file. Yields text for each 'conversion' record.
+
+    Read errors propagate (a truncated file must not end the scan silently)."""
     ArchiveIterator = _import_warcio()
     with open(wet_path, "rb") as fh:
-        try:
-            for record in ArchiveIterator(fh):
-                if record.rec_type != "conversion":
-                    continue
-                if column == "url":
-                    yield record.rec_headers.get_header("WARC-Target-URI") or ""
-                else:
-                    content = record.content_stream().read()
-                    yield content.decode("utf-8", errors="replace") if content else ""
-        except Exception as e:
-            print(f"[warn] iter_wet_texts: {wet_path}: {e}", file=sys.stderr)
+        for record in ArchiveIterator(fh):
+            if record.rec_type != "conversion":
+                continue
+            if column == "url":
+                yield record.rec_headers.get_header("WARC-Target-URI") or ""
+            else:
+                content = record.content_stream().read()
+                yield content.decode("utf-8", errors="replace") if content else ""
 
 
 def count_rows_for_path(path: str, fmt: str) -> int | None:
@@ -252,21 +266,56 @@ def get_fragment_paths(path: str, fmt: str = "parquet") -> list[str]:
     return [frag.path for frag in make_dataset(path).get_fragments()]
 
 
-def iter_texts(path, column, batch_size, fmt="parquet"):
-    """Sequential text iterator."""
+def _check_listing(path: str, files: list[str]):
+    """Refuse inputs that pyarrow discovery reads wrongly without an error.
+
+    A broken symlink is left out of the listing, and a symlinked directory that
+    points back up the tree (a loop) lists the same files many times.
+    """
+    if os.path.isdir(path):
+        for root, dirs, names in os.walk(path):
+            dirs[:] = [d for d in dirs if not d.startswith((".", "_"))]
+            for name in names:
+                p = os.path.join(root, name)
+                if not name.startswith((".", "_")) and not os.path.exists(p):
+                    raise FileNotFoundError(f"broken symlink: {p}")
+    if len({os.path.realpath(f) for f in files}) != len(files):
+        raise ValueError(f"{path}: the same file is reached through more than one path "
+                         f"(symlink loop?)")
+
+
+def iter_indexed_texts(path, column, batch_size, fmt="parquet", stats: dict | None = None):
+    """
+    Sequential (physical_row_idx, text) iterator.
+
+    The index counts every row, null ones included, so it is the same row number the
+    writer (Step 5) uses. Null rows are not yielded: they are never scored and always kept.
+    If `stats` is given, it receives physical_rows and null_rows once the iterator is exhausted.
+    """
+    row_idx = 0
+    n_null = 0
     if fmt == "wet":
+        # WET records have no null text: every 'conversion' record is one row
         for wet_path in get_wet_fragment_paths(path):
-            yield from iter_wet_texts(wet_path, column)
-        return
-    dataset = make_dataset(path)
-    if hasattr(dataset, "scanner"):
-        batches = dataset.scanner(columns=[column], batch_size=batch_size).to_batches()
+            for text in iter_wet_texts(wet_path, column):
+                yield row_idx, text
+                row_idx += 1
     else:
-        batches = dataset.to_batches(columns=[column], batch_size=batch_size)
-    for batch in batches:
-        for x in batch.column(0).to_pylist():
-            if x is not None:
-                yield x if isinstance(x, str) else str(x)
+        dataset = make_dataset(path)
+        if hasattr(dataset, "scanner"):
+            batches = dataset.scanner(columns=[column], batch_size=batch_size).to_batches()
+        else:
+            batches = dataset.to_batches(columns=[column], batch_size=batch_size)
+        for batch in batches:
+            for x in batch.column(0).to_pylist():
+                if x is None:
+                    n_null += 1
+                else:
+                    yield row_idx, (x if isinstance(x, str) else str(x))
+                row_idx += 1
+    if stats is not None:
+        stats["physical_rows"] = row_idx
+        stats["null_rows"] = n_null
 
 
 # ============================================================
@@ -286,11 +335,12 @@ def _bench_scan_worker_init(shared_rows, shared_tokens, shared_frags):
 
 def _bench_scan_worker(args: tuple) -> tuple[str, int]:
     """Returns (temp_file_path, total_tokens). Counter saved to temp file to avoid pipe deadlock."""
-    fragment_path, column, batch_size = args
+    fragment_path, column, batch_size, tmp_dir = args
     counts = Counter()
     total_tokens = 0
     try:
         frag_ds = ds.dataset(fragment_path, format="parquet")
+        _require_column(frag_ds, column)
         for batch in frag_ds.scanner(columns=[column], batch_size=batch_size).to_batches():
             rows_list = batch.column(0).to_pylist()
             batch_tokens = 0
@@ -304,11 +354,12 @@ def _bench_scan_worker(args: tuple) -> tuple[str, int]:
             _g_shared_rows.value += len(rows_list)
             _g_shared_tokens.value += batch_tokens
     except Exception as e:
-        print(f"[warn] bench_scan_worker: {fragment_path}: {e}", file=sys.stderr)
+        # Never drop a file from Q silently: the parent stops the run and names the file
+        raise RuntimeError(_file_error(fragment_path, e)) from None
     finally:
         _g_shared_frags.value += 1
     # Write Counter to temp file instead of returning it through pipe
-    fd, tmp_path = tempfile.mkstemp(suffix=".pkl", prefix="ce_bench_")
+    fd, tmp_path = tempfile.mkstemp(suffix=".pkl", prefix="ce_bench_", dir=tmp_dir)
     with os.fdopen(fd, "wb") as f:
         pickle.dump(counts, f, protocol=pickle.HIGHEST_PROTOCOL)
     return tmp_path, total_tokens
@@ -328,19 +379,22 @@ def _train_scan_worker_init(bench_vocab, shared_rows, shared_tokens, shared_frag
     _g_shared_frags = shared_frags
 
 
-def _train_scan_worker(args: tuple) -> tuple[str, int]:
-    """Returns (temp_file_path, total_tokens). Counter saved to temp file to avoid pipe deadlock."""
-    fragment_path, column, batch_size = args
+def _train_scan_worker(args: tuple) -> tuple[str, int, int]:
+    """Returns (temp_file_path, total_tokens, null_rows). Counter saved to temp file to avoid pipe deadlock."""
+    fragment_path, column, batch_size, tmp_dir = args
     counts = Counter()
     total_tokens = 0
+    null_rows = 0
     bench_vocab = _g_bench_vocab_for_scan
     try:
         frag_ds = ds.dataset(fragment_path, format="parquet")
+        _require_column(frag_ds, column)
         for batch in frag_ds.scanner(columns=[column], batch_size=batch_size).to_batches():
             rows_list = batch.column(0).to_pylist()
             batch_tokens = 0
             for x in rows_list:
                 if x is None:
+                    null_rows += 1
                     continue
                 toks = tokenize(x if isinstance(x, str) else str(x))
                 batch_tokens += len(toks)
@@ -351,14 +405,15 @@ def _train_scan_worker(args: tuple) -> tuple[str, int]:
             _g_shared_rows.value += len(rows_list)
             _g_shared_tokens.value += batch_tokens
     except Exception as e:
-        print(f"[warn] train_scan_worker: {fragment_path}: {e}", file=sys.stderr)
+        # Never drop a file from the counts silently: the parent stops the run and names the file
+        raise RuntimeError(_file_error(fragment_path, e)) from None
     finally:
         _g_shared_frags.value += 1
     # Write Counter to temp file instead of returning it through pipe
-    fd, tmp_path = tempfile.mkstemp(suffix=".pkl", prefix="ce_train_")
+    fd, tmp_path = tempfile.mkstemp(suffix=".pkl", prefix="ce_train_", dir=tmp_dir)
     with os.fdopen(fd, "wb") as f:
         pickle.dump(counts, f, protocol=pickle.HIGHEST_PROTOCOL)
-    return tmp_path, total_tokens
+    return tmp_path, total_tokens, null_rows
 
 
 # ============================================================
@@ -366,7 +421,7 @@ def _train_scan_worker(args: tuple) -> tuple[str, int]:
 # ============================================================
 def _bench_scan_worker_wet(args: tuple) -> tuple[str, int, int]:
     """WET bench scan worker. Returns (temp_file_path, total_tokens, rows_scanned)."""
-    fragment_path, column, batch_size = args
+    fragment_path, column, batch_size, tmp_dir = args
     counts = Counter()
     total_tokens = 0
     rows_scanned = 0
@@ -390,10 +445,10 @@ def _bench_scan_worker_wet(args: tuple) -> tuple[str, int, int]:
             _g_shared_rows.value += batch_rows
             _g_shared_tokens.value += batch_tokens
     except Exception as e:
-        print(f"[warn] bench_scan_worker_wet: {fragment_path}: {e}", file=sys.stderr)
+        raise RuntimeError(_file_error(fragment_path, e)) from None
     finally:
         _g_shared_frags.value += 1
-    fd, tmp_path = tempfile.mkstemp(suffix=".pkl", prefix="ce_bench_wet_")
+    fd, tmp_path = tempfile.mkstemp(suffix=".pkl", prefix="ce_bench_wet_", dir=tmp_dir)
     with os.fdopen(fd, "wb") as f:
         pickle.dump(counts, f, protocol=pickle.HIGHEST_PROTOCOL)
     return tmp_path, total_tokens, rows_scanned
@@ -404,7 +459,7 @@ def _bench_scan_worker_wet(args: tuple) -> tuple[str, int, int]:
 # ============================================================
 def _train_scan_worker_wet(args: tuple) -> tuple[str, int, int]:
     """WET train scan worker. Returns (temp_file_path, total_tokens, rows_scanned)."""
-    fragment_path, column, batch_size = args
+    fragment_path, column, batch_size, tmp_dir = args
     counts = Counter()
     total_tokens = 0
     rows_scanned = 0
@@ -431,10 +486,10 @@ def _train_scan_worker_wet(args: tuple) -> tuple[str, int, int]:
             _g_shared_rows.value += batch_rows
             _g_shared_tokens.value += batch_tokens
     except Exception as e:
-        print(f"[warn] train_scan_worker_wet: {fragment_path}: {e}", file=sys.stderr)
+        raise RuntimeError(_file_error(fragment_path, e)) from None
     finally:
         _g_shared_frags.value += 1
-    fd, tmp_path = tempfile.mkstemp(suffix=".pkl", prefix="ce_train_wet_")
+    fd, tmp_path = tempfile.mkstemp(suffix=".pkl", prefix="ce_train_wet_", dir=tmp_dir)
     with os.fdopen(fd, "wb") as f:
         pickle.dump(counts, f, protocol=pickle.HIGHEST_PROTOCOL)
     return tmp_path, total_tokens, rows_scanned
@@ -456,8 +511,17 @@ def build_benchmark_q_parallel(
     if n_frags == 0:
         raise ValueError(f"No fragments found in {path}. Check path and format.")
 
-    # shared Value counters + progress thread
+    # The workers' Counter pickles go to this scan's own temp directory, removed as a whole
+    # (after a failure it may also hold pickles that were written but never received)
+    scan_tmp = tempfile.mkdtemp(prefix="ce_scan_")
+
+    # shared Value counters + pool, then the progress thread (no fork after a thread starts)
     shared_rows, shared_tokens, shared_frags = _make_shared_counters()
+    pool = mp.Pool(
+        processes=effective_workers,
+        initializer=_bench_scan_worker_init,
+        initargs=(shared_rows, shared_tokens, shared_frags),
+    )
     stop_event = threading.Event()
     printer = threading.Thread(
         target=_progress_printer,
@@ -467,18 +531,14 @@ def build_benchmark_q_parallel(
     )
     printer.start()
 
-    args_list = [(fp, column, batch_size) for fp in fragment_paths]
+    args_list = [(fp, column, batch_size, scan_tmp) for fp in fragment_paths]
     total_counts = Counter()
     total_tokens = 0
     rows_scanned = 0
     worker_fn = _bench_scan_worker_wet if fmt == "wet" else _bench_scan_worker
 
-    pool = mp.Pool(
-        processes=effective_workers,
-        initializer=_bench_scan_worker_init,
-        initargs=(shared_rows, shared_tokens, shared_frags),
-    )
     tmp_files = []
+    failure = None
     try:
         for result in pool.imap_unordered(worker_fn, args_list):
             if fmt == "wet":
@@ -488,21 +548,31 @@ def build_benchmark_q_parallel(
                 tmp_path, partial_tokens = result
             total_tokens += partial_tokens
             tmp_files.append(tmp_path)
+    except Exception as e:
+        # A benchmark file could not be read: stop instead of building Q without it
+        failure = e
+        pool.terminate()
     finally:
         pool.close()
         pool.join()
         stop_event.set()
         printer.join(timeout=10)
+    if failure is not None:
+        shutil.rmtree(scan_tmp, ignore_errors=True)
+        _fail(f"bench-scan: {failure}")
 
     # Merge counters from temp files (outside pool to avoid pipe issues)
-    for tmp_path in tmp_files:
-        with open(tmp_path, "rb") as f:
-            partial_counts = pickle.load(f)
-        total_counts.update(partial_counts)
-        os.unlink(tmp_path)
+    try:
+        for tmp_path in tmp_files:
+            with open(tmp_path, "rb") as f:
+                partial_counts = pickle.load(f)
+            total_counts.update(partial_counts)
+    finally:
+        shutil.rmtree(scan_tmp, ignore_errors=True)
 
     if total_tokens == 0:
-        raise ValueError("Benchmark has zero tokens. Check column/path.")
+        raise ValueError(f"Benchmark has zero tokens in column '{column}' of {path}. "
+                         f"Check column/path.")
 
     if fmt != "wet":
         rows_scanned = total_rows
@@ -517,8 +587,8 @@ def build_train_counts_parallel(
     path, column, bench_vocab, n_workers,
     batch_size=8192, progress_name="train-scan", progress_every=50_000,
     fmt="parquet",
-) -> tuple[Counter, int, int]:
-    """Parallel-scan the training-data counts per fragment. Returns (counts, total_tokens, rows_scanned)."""
+) -> tuple[Counter, int, int, int]:
+    """Parallel-scan the training-data counts per fragment. Returns (counts, total_tokens, rows_scanned, null_rows)."""
     fragment_paths = get_fragment_paths(path, fmt=fmt)
     n_frags = len(fragment_paths)
     effective_workers = min(n_workers, n_frags)
@@ -530,10 +600,19 @@ def build_train_counts_parallel(
     if n_frags == 0:
         print(f"[{progress_name}] WARNING: no fragments found, returning empty counts.",
               file=sys.stderr)
-        return Counter(), 0, 0
+        return Counter(), 0, 0, 0
 
-    # shared Value counters + progress thread
+    # The workers' Counter pickles go to this scan's own temp directory, removed as a whole
+    # (after a failure it may also hold pickles that were written but never received)
+    scan_tmp = tempfile.mkdtemp(prefix="ce_scan_")
+
+    # shared Value counters + pool, then the progress thread (no fork after a thread starts)
     shared_rows, shared_tokens, shared_frags = _make_shared_counters()
+    pool = mp.Pool(
+        processes=effective_workers,
+        initializer=_train_scan_worker_init,
+        initargs=(bench_vocab, shared_rows, shared_tokens, shared_frags),
+    )
     stop_event = threading.Event()
     printer = threading.Thread(
         target=_progress_printer,
@@ -543,46 +622,53 @@ def build_train_counts_parallel(
     )
     printer.start()
 
-    args_list = [(fp, column, batch_size) for fp in fragment_paths]
+    args_list = [(fp, column, batch_size, scan_tmp) for fp in fragment_paths]
     total_counts = Counter()
     total_tokens = 0
     rows_scanned = 0
+    null_rows = 0
     worker_fn = _train_scan_worker_wet if fmt == "wet" else _train_scan_worker
 
-    pool = mp.Pool(
-        processes=effective_workers,
-        initializer=_train_scan_worker_init,
-        initargs=(bench_vocab, shared_rows, shared_tokens, shared_frags),
-    )
     tmp_files = []
+    failure = None
     try:
         for result in pool.imap_unordered(worker_fn, args_list):
             if fmt == "wet":
                 tmp_path, partial_tokens, partial_rows = result
                 rows_scanned += partial_rows
             else:
-                tmp_path, partial_tokens = result
+                tmp_path, partial_tokens, partial_null = result
+                null_rows += partial_null
             total_tokens += partial_tokens
             tmp_files.append(tmp_path)
+    except Exception as e:
+        # A corpus file could not be read: stop instead of counting without it
+        failure = e
+        pool.terminate()
     finally:
         pool.close()
         pool.join()
         stop_event.set()
         printer.join(timeout=10)
+    if failure is not None:
+        shutil.rmtree(scan_tmp, ignore_errors=True)
+        _fail(f"{progress_name}: {failure}")
 
     # Merge counters from temp files (outside pool to avoid pipe issues)
-    for tmp_path in tmp_files:
-        with open(tmp_path, "rb") as f:
-            partial_counts = pickle.load(f)
-        total_counts.update(partial_counts)
-        os.unlink(tmp_path)
+    try:
+        for tmp_path in tmp_files:
+            with open(tmp_path, "rb") as f:
+                partial_counts = pickle.load(f)
+            total_counts.update(partial_counts)
+    finally:
+        shutil.rmtree(scan_tmp, ignore_errors=True)
 
     if fmt != "wet":
         rows_scanned = total_rows
 
     print(f"[{progress_name}] bench_vocab_hits={sum(total_counts.values()):,} "
           f"rows={rows_scanned:,}", file=sys.stderr)
-    return total_counts, total_tokens, rows_scanned
+    return total_counts, total_tokens, rows_scanned, null_rows
 
 
 # ============================================================
@@ -693,7 +779,7 @@ def score_rows_parallel(
     train_path, train_col,
     q, train_counts, train_total_tokens, B, D, bench_vocab, k,
     batch_size=8192, n_workers=120, worker_batch=1024, progress_every=50_000,
-    fmt="parquet", total_rows_hint=None,
+    fmt="parquet", total_rows_hint=None, null_rows_hint=None,
 ) -> list[tuple[float, int]]:
     """
     120-core parallel ΔH scoring.
@@ -701,6 +787,7 @@ def score_rows_parallel(
     collects results, so it can track progress directly).
 
     Recommended worker_batch: 1024-2048 (for ~120 cores).
+    Returns the heap of the K removed rows as (-ΔH bits, physical row index).
     """
     if fmt == "parquet":
         total_rows = make_dataset(train_path).count_rows()
@@ -708,13 +795,14 @@ def score_rows_parallel(
         total_rows = total_rows_hint
     prog = Progress("deltaH-score", total_rows, every=progress_every)
     heap: list[tuple[float, int]] = []
+    scan_stats: dict = {}
 
     def _batch_generator():
         buf = []
-        row_idx = 0
-        for text in iter_texts(train_path, train_col, batch_size, fmt=fmt):
+        # Physical row indices (null rows skipped but counted): the numbering the writer uses
+        for row_idx, text in iter_indexed_texts(train_path, train_col, batch_size,
+                                                fmt=fmt, stats=scan_stats):
             buf.append((row_idx, text))
-            row_idx += 1
             if len(buf) >= worker_batch:
                 yield buf
                 buf = []
@@ -731,17 +819,34 @@ def score_rows_parallel(
             _score_batch, _batch_generator(), chunksize=4
         ):
             for delta_bits, row_idx in scored_batch:
-                key = -delta_bits
+                # Removal order is the total order on (-ΔH, row_idx): the heap keeps the K
+                # largest pairs. Among rows with equal ΔH at the cutoff the larger row index
+                # is removed first (earlier rows are kept), whatever order batches arrive in.
+                item = (-delta_bits, row_idx)
                 if len(heap) < k:
-                    heapq.heappush(heap, (key, row_idx))
-                elif key > heap[0][0]:
-                    heapq.heapreplace(heap, (key, row_idx))
+                    heapq.heappush(heap, item)
+                elif k > 0 and item > heap[0]:
+                    heapq.heapreplace(heap, item)
             prog.update(len(scored_batch))
     finally:
         pool.close()
         pool.join()
 
     prog.done()
+
+    # Guard: every corpus row was either scored or null, so the scoring indices are the
+    # writer's physical row numbers (checked here because --skip_seq_apply skips seq-apply)
+    n_null = scan_stats.get("null_rows", 0)
+    n_physical = scan_stats.get("physical_rows", 0)
+    if prog.count + n_null != total_rows or n_physical != total_rows:
+        _fail(f"deltaH-score: scored {prog.count:,} + null {n_null:,} rows "
+              f"(physical {n_physical:,}) != corpus rows {total_rows:,} in {train_path}")
+    if null_rows_hint is not None and n_null != null_rows_hint:
+        _fail(f"deltaH-score: {n_null:,} null rows in {train_path}, but the Step 2 scan "
+              f"counted {null_rows_hint:,} (did the corpus change during the run?)")
+    if n_null:
+        print(f"[deltaH-score] null text rows: {n_null:,} (not scored, always kept)",
+              file=sys.stderr)
     return heap
 
 
@@ -750,13 +855,14 @@ def score_rows_parallel(
 # ============================================================
 def _write_filtered_parquet(train_path, remove_indices, total_rows, rows_per_shard,
                             n_shards, shard_path, batch_size=8192, progress_every=50_000):
-    """Write filtered parquet from parquet source."""
+    """Write filtered parquet from parquet source. Returns (rows_seen, rows_written)."""
     train_dataset = make_dataset(train_path)
     prog_write = Progress("write-filtered", total_rows, every=progress_every)
     writers: list[pq.ParquetWriter | None] = [None] * n_shards
     shard_idx = 0
     shard_row_count = 0
     row_idx = 0
+    rows_written = 0
 
     batches = (train_dataset.scanner(batch_size=batch_size).to_batches()
                if hasattr(train_dataset, "scanner")
@@ -764,11 +870,13 @@ def _write_filtered_parquet(train_path, remove_indices, total_rows, rows_per_sha
 
     for batch in batches:
         n = batch.num_rows
+        # Physical row numbers, null rows included (they are never in remove_indices)
         keep_mask = pa.array(
             [(row_idx + i) not in remove_indices for i in range(n)],
             type=pa.bool_(),
         )
         filtered_batch = batch.filter(keep_mask)
+        rows_written += filtered_batch.num_rows
 
         if filtered_batch.num_rows > 0:
             if n_shards == 1:
@@ -807,11 +915,12 @@ def _write_filtered_parquet(train_path, remove_indices, total_rows, rows_per_sha
         if w is not None:
             w.close()
     prog_write.done()
+    return row_idx, rows_written
 
 
 def _write_filtered_wet(train_path, remove_indices, total_rows, rows_per_shard,
                         n_shards, shard_path, batch_size=8192, progress_every=50_000):
-    """Write filtered parquet from WET source. Output columns: text, url."""
+    """Write filtered parquet from WET source. Output columns: text, url. Returns (rows_seen, rows_written)."""
     ArchiveIterator = _import_warcio()
     schema = pa.schema([("text", pa.string()), ("url", pa.string())])
     prog_write = Progress("write-filtered", total_rows, every=progress_every)
@@ -819,6 +928,7 @@ def _write_filtered_wet(train_path, remove_indices, total_rows, rows_per_shard,
     shard_idx = 0
     shard_row_count = 0
     row_idx = 0
+    rows_written = 0
 
     # Buffer for batch writing
     buf_texts: list[str] = []
@@ -871,6 +981,7 @@ def _write_filtered_wet(train_path, remove_indices, total_rows, rows_per_shard,
                     text = content.decode("utf-8", errors="replace") if content else ""
                     buf_texts.append(text)
                     buf_urls.append(url)
+                    rows_written += 1
                     if len(buf_texts) >= batch_size:
                         flush_buffer()
                 else:
@@ -885,6 +996,7 @@ def _write_filtered_wet(train_path, remove_indices, total_rows, rows_per_shard,
         if w is not None:
             w.close()
     prog_write.done()
+    return row_idx, rows_written
 
 
 # ============================================================
@@ -924,6 +1036,64 @@ def _clean_ckpt(out_parquet: str):
         print(f"[ckpt] cleaned up {d}", file=sys.stderr)
 
 
+def _path_fingerprint(path: str, fmt: str) -> dict:
+    """Cheap dataset fingerprint (metadata only): sorted [file, size, mtime_ns] list + row count."""
+    root = path if os.path.isdir(path) else (os.path.dirname(path) or ".")
+    files = []
+    for p in get_fragment_paths(path, fmt=fmt):
+        st = os.stat(p)
+        files.append([os.path.relpath(p, root), st.st_size, st.st_mtime_ns])
+    files.sort()
+    return {"files": files, "rows": count_rows_for_path(path, fmt)}
+
+
+def _run_config(args, bench_fmt: str, train_fmt: str) -> dict:
+    """Settings that determine the selection; --resume refuses checkpoints made with others."""
+    return {
+        "bench_path": os.path.abspath(args.bench_path),
+        "bench_col": args.bench_col,
+        "bench_format": bench_fmt,
+        "train_path": os.path.abspath(args.train_path),
+        "train_col": args.train_col,
+        "train_format": train_fmt,
+        "top_pct": args.top_pct,
+        "bench_files": _path_fingerprint(args.bench_path, bench_fmt),
+        "corpus_files": _path_fingerprint(args.train_path, train_fmt),
+    }
+
+
+def _save_run_config(out_parquet: str, config: dict):
+    d = _ckpt_dir(out_parquet)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "run_config.json"), "w") as f:
+        json.dump(config, f, indent=1)
+
+
+def _check_resume_config(out_parquet: str, config: dict):
+    """Exit non-zero if existing checkpoints were made with other settings or other files."""
+    d = _ckpt_dir(out_parquet)
+    if not any(os.path.exists(os.path.join(d, f"step{i}.pkl")) for i in (3, 4, 5)):
+        return  # nothing to resume: the run starts from Step 1
+    path = os.path.join(d, "run_config.json")
+    if not os.path.exists(path):
+        _fail(f"--resume: {d} has checkpoints but no run_config.json (older version?); "
+              f"delete {d} or run without --resume")
+    with open(path) as f:
+        saved = json.load(f)
+    diffs = []
+    for key in sorted(set(saved) | set(config)):
+        old, new = saved.get(key), config.get(key)
+        if old == new:
+            continue
+        if key.endswith("_files"):
+            diffs.append(f"{key}: file list, sizes, mtimes or row count changed")
+        else:
+            diffs.append(f"{key}: {old!r} -> {new!r}")
+    if diffs:
+        _fail(f"--resume: checkpoints in {d} were made with different settings or files "
+              f"({'; '.join(diffs)}); delete {d} or run without --resume")
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -931,18 +1101,26 @@ def main():
     parser = argparse.ArgumentParser(
         description="Cross-entropy training-data filtering (120-core optimized)"
     )
-    parser.add_argument("--bench_path",      required=True)
+    parser.add_argument("--bench_path",      required=True,
+                        help="Benchmark parquet file, or a directory whose files are pooled into one token-weighted Q.")
     parser.add_argument("--bench_col",       default="text")
-    parser.add_argument("--train_path",      required=True)
+    parser.add_argument("--train_path",      default=None,
+                        help="Pre-training corpus (parquet file or directory, or WET directory). "
+                             "Required except with --verify_only.")
     parser.add_argument("--train_col",       default="text")
     parser.add_argument("--out_parquet",     required=True)
     parser.add_argument("--out_num_shards",  type=int,   default=1,
                         help="Number of output parquet shards. 1 = single file; N = N shard files under a directory.")
-    parser.add_argument("--top_pct",         type=float, default=0.5)
+    parser.add_argument("--top_pct",         type=float, default=80.0,
+                        help="Percent of rows to REMOVE: the rows with the smallest ΔH (the least aligned "
+                             "with Q); all other rows are written. Must be in [0, 100). "
+                             "Default 80 = the paper setting (removes 80%%, keeps 20%%).")
     parser.add_argument("--batch_size",      type=int,   default=8192)
     parser.add_argument("--worker_batch",    type=int,   default=1024,
                         help="Rows per scoring-worker batch (recommended: 1024-2048).")
-    parser.add_argument("--n_workers",       type=int,   default=120)
+    parser.add_argument("--n_workers",       type=int,   default=120,
+                        help="Worker processes per pool, capped at the number of CPUs. Each scan also "
+                             "uses at most one per file, and the Step 6 scan at most 20.")
     parser.add_argument("--progress_every",  type=int,   default=50000,
                         help="Progress reporting interval in rows; scan also emits on each batch/fragment completion.")
     parser.add_argument("--train_format",    choices=["parquet", "wet"], default=None,
@@ -952,17 +1130,35 @@ def main():
     parser.add_argument("--resume",          action="store_true", default=False,
                         help="Resume from checkpoints; skip stages already completed if any.")
     parser.add_argument("--verify_only",    action="store_true", default=False,
-                        help="Only re-compute CE on the output parquet (skip Steps 2-5).")
+                        help="Only re-compute CE on the output parquet (skip Steps 2-5); --train_path is not needed.")
     parser.add_argument("--skip_step6",    action="store_true", default=False,
                         help="Skip Step 6 (CE re-computation verification + consistency check).")
     parser.add_argument("--skip_seq_apply", action="store_true", default=False,
                         help="Skip only the seq-apply consistency check in Step 6 (single-threaded, redundant; CE recompute still runs).")
     args = parser.parse_args()
 
-    # Format detection
+    if args.train_path is None and not args.verify_only:
+        parser.error("--train_path is required (except with --verify_only)")
+    # --verify_only does not use --top_pct
+    if not args.verify_only and not 0 <= args.top_pct < 100:
+        parser.error(f"--top_pct must be in [0, 100) (percent of rows removed), got {args.top_pct}")
+    if args.n_workers < 1:
+        parser.error(f"--n_workers must be at least 1, got {args.n_workers}")
+    if 0 < args.top_pct < 1 and not args.verify_only:
+        print(f"[warn] --top_pct {args.top_pct} removes only {args.top_pct}% of rows; it is a percent "
+              f"(80 removes 80%), not a fraction", file=sys.stderr)
+
+    # Format detection (--verify_only reads only the parquet output, never --train_path)
     bench_fmt = detect_format(args.bench_path, args.bench_format)
-    train_fmt = detect_format(args.train_path, args.train_format)
+    train_fmt = "parquet" if args.verify_only else detect_format(args.train_path, args.train_format)
     print(f"[format] bench={bench_fmt} | train={train_fmt}", file=sys.stderr)
+
+    # Before anything reads the parquet inputs: pyarrow discovery skips broken symlinks and
+    # follows symlink loops without an error, which would change the counts
+    if bench_fmt == "parquet":
+        _check_listing(args.bench_path, get_fragment_paths(args.bench_path))
+    if not args.verify_only and train_fmt == "parquet":
+        _check_listing(args.train_path, get_fragment_paths(args.train_path))
 
     # Validate columns for WET
     wet_valid_cols = {"text", "url"}
@@ -973,7 +1169,11 @@ def main():
         raise ValueError(f"--train_col '{args.train_col}' not valid for WET format. "
                          f"Use one of: {wet_valid_cols}")
 
-    n_workers = args.n_workers
+    # At most one worker process per CPU, in every pool (scans, scoring, Step 6)
+    n_workers = max(1, min(args.n_workers, os.cpu_count() or 1))
+    if n_workers < args.n_workers:
+        print(f"[config] --n_workers {args.n_workers} capped at the CPU count: {n_workers}",
+              file=sys.stderr)
     use_resume = args.resume
     print(f"[config] n_workers={n_workers} | worker_batch={args.worker_batch} | "
           f"batch_size={args.batch_size} | progress_every={args.progress_every:,}"
@@ -1000,7 +1200,7 @@ def main():
 
         print(f"\n=== [verify_only] Recompute CE on filtered output ===", file=sys.stderr)
         step6_workers = min(n_workers, 20)
-        filtered_counts, filtered_total_tokens, _ = build_train_counts_parallel(
+        filtered_counts, filtered_total_tokens, _, _ = build_train_counts_parallel(
             out_read_path, args.train_col, bench_vocab,
             n_workers=step6_workers, batch_size=args.batch_size,
             progress_name="train-scan(filtered)", progress_every=args.progress_every,
@@ -1012,6 +1212,11 @@ def main():
         print(f"\n[verify_only] H_after (recomputed) = {H_after_bits:.6f} bits")
         print(f"[verify_only] Done.", file=sys.stderr)
         return
+
+    # Settings + file fingerprints: saved with the checkpoints, checked by --resume
+    run_config = _run_config(args, bench_fmt, train_fmt)
+    if use_resume:
+        _check_resume_config(args.out_parquet, run_config)
 
     # -------- Try loading checkpoints (newest first) --------
     ckpt5 = _load_ckpt(args.out_parquet, "step5") if use_resume else None
@@ -1026,6 +1231,7 @@ def main():
         train_total_tokens = ckpt5["train_total_tokens"]
         H_before_bits  = ckpt5["H_before_bits"]
         total_rows     = ckpt5["total_rows"]
+        null_rows      = ckpt5["null_rows"]
         k              = ckpt5["k"]
         remove_indices = ckpt5["remove_indices"]
         sum_selected_delta_bits = ckpt5["sum_selected_delta_bits"]
@@ -1041,6 +1247,7 @@ def main():
         train_total_tokens = ckpt4["train_total_tokens"]
         H_before_bits  = ckpt4["H_before_bits"]
         total_rows     = ckpt4["total_rows"]
+        null_rows      = ckpt4["null_rows"]
         k              = ckpt4["k"]
         remove_indices = ckpt4["remove_indices"]
         sum_selected_delta_bits = ckpt4["sum_selected_delta_bits"]
@@ -1059,6 +1266,7 @@ def main():
             B              = ckpt3["B"]
             D              = ckpt3["D"]
             total_rows     = ckpt3["total_rows"]
+            null_rows      = ckpt3["null_rows"]
             k              = ckpt3["k"]
             print(f"[ckpt] ✓ Resuming from Step 4 (Steps 1-3 skipped)", file=sys.stderr)
             print(f"[ckpt]   total_rows={total_rows:,} | K={k:,} | "
@@ -1076,12 +1284,16 @@ def main():
 
             # -------- 2. Training counts & H_before --------
             print("\n=== Step 2/6: Train counts before filtering (parallel scan) ===", file=sys.stderr)
-            train_counts, train_total_tokens, train_rows_scanned = build_train_counts_parallel(
+            train_counts, train_total_tokens, train_rows_scanned, null_rows = build_train_counts_parallel(
                 args.train_path, args.train_col, bench_vocab,
                 n_workers=n_workers, batch_size=args.batch_size,
                 progress_name="train-scan(before)", progress_every=args.progress_every,
                 fmt=train_fmt,
             )
+            if train_total_tokens == 0:
+                # H would silently come out as log2|V_bench| (every benchmark word floored to count 1)
+                _fail(f"train-scan(before): no word tokens in column '{args.train_col}' of "
+                      f"pretraining corpus at {args.train_path}")
 
             H_before_bits = nats_to_bits(compute_cross_entropy_nats(q, train_counts, train_total_tokens))
             print(f"[before] H(q,p) = {H_before_bits:.6f} bits")
@@ -1095,11 +1307,24 @@ def main():
                 total_rows = make_dataset(args.train_path).count_rows()
             else:
                 total_rows = train_rows_scanned
-            k = max(1, int(total_rows * args.top_pct / 100.0))
+            # K counts only rows with text. Null-text rows are never scored or removed and are
+            # written unchanged, so they do not change which text rows are selected (and K can
+            # never exceed the number of scored rows). top_pct 0 removes nothing; any
+            # top_pct > 0 removes at least one row, as before.
+            text_rows = total_rows - null_rows
+            k = 0 if args.top_pct == 0 else max(1, int(text_rows * args.top_pct / 100.0))
+            k = min(k, text_rows)
             print(f"\n=== Step 3/6: Selection target ===", file=sys.stderr)
             print(f"[select] total_rows={total_rows:,} | top_pct={args.top_pct}% | K={k:,}",
                   file=sys.stderr)
+            if null_rows:
+                print(f"[select] null_rows={null_rows:,} (never scored, always kept) | "
+                      f"K counts the {text_rows:,} rows with text", file=sys.stderr)
 
+            # Fresh run: drop checkpoints of any earlier run so --resume never mixes runs,
+            # then record the settings --resume checks
+            _clean_ckpt(args.out_parquet)
+            _save_run_config(args.out_parquet, run_config)
             # Save checkpoint after Steps 1-3
             _save_ckpt(args.out_parquet, "step3", {
                 "q": q, "bench_vocab": bench_vocab,
@@ -1107,7 +1332,7 @@ def main():
                 "train_total_tokens": train_total_tokens,
                 "H_before_bits": H_before_bits,
                 "B": B, "D": D,
-                "total_rows": total_rows, "k": k,
+                "total_rows": total_rows, "null_rows": null_rows, "k": k,
             })
 
         # -------- 4. ΔH scoring --------
@@ -1117,7 +1342,7 @@ def main():
             q, train_counts, train_total_tokens, B, D, bench_vocab, k,
             batch_size=args.batch_size, n_workers=n_workers,
             worker_batch=args.worker_batch, progress_every=args.progress_every,
-            fmt=train_fmt, total_rows_hint=total_rows,
+            fmt=train_fmt, total_rows_hint=total_rows, null_rows_hint=null_rows,
         )
 
         remove_indices = {idx for _, idx in heap}
@@ -1130,7 +1355,7 @@ def main():
             "train_counts": train_counts,
             "train_total_tokens": train_total_tokens,
             "H_before_bits": H_before_bits,
-            "total_rows": total_rows, "k": k,
+            "total_rows": total_rows, "null_rows": null_rows, "k": k,
             "remove_indices": remove_indices,
             "sum_selected_delta_bits": sum_selected_delta_bits,
         })
@@ -1174,7 +1399,7 @@ def main():
 
         if train_fmt == "wet":
             # --- WET write path: re-read WET files, output as parquet ---
-            _write_filtered_wet(
+            rows_seen, rows_written = _write_filtered_wet(
                 args.train_path, remove_indices,
                 total_rows, rows_per_shard,
                 n_shards, shard_path,
@@ -1182,12 +1407,18 @@ def main():
             )
         else:
             # --- Parquet write path (original) ---
-            _write_filtered_parquet(
+            rows_seen, rows_written = _write_filtered_parquet(
                 args.train_path, remove_indices,
                 total_rows, rows_per_shard,
                 n_shards, shard_path,
                 batch_size=args.batch_size, progress_every=args.progress_every,
             )
+
+        # Guard (also under --skip_seq_apply): the writer saw every corpus row and wrote
+        # exactly the rows that were not removed
+        if rows_seen != total_rows or rows_written != rows_to_keep:
+            _fail(f"write: read {rows_seen:,} of {total_rows:,} corpus rows and wrote "
+                  f"{rows_written:,} rows, expected {rows_to_keep:,}; {out_dir or args.out_parquet} is not valid")
 
         if n_shards > 1:
             print(f"[write] output dir: {out_dir}  ({n_shards} shards)", file=sys.stderr)
@@ -1200,26 +1431,30 @@ def main():
             "train_counts": train_counts,
             "train_total_tokens": train_total_tokens,
             "H_before_bits": H_before_bits,
-            "total_rows": total_rows, "k": k,
+            "total_rows": total_rows, "null_rows": null_rows, "k": k,
             "remove_indices": remove_indices,
             "sum_selected_delta_bits": sum_selected_delta_bits,
         })
 
     # Path Step 6 will read from (single file or directory)
     out_read_path = out_dir if n_shards > 1 else args.out_parquet
+    # Realised share of removed rows (null rows count in the total but are never removed)
+    removed_pct = 100.0 * len(remove_indices) / total_rows if total_rows else 0.0
 
     if args.skip_step6:
         print("\n=== Step 6/6: SKIPPED (--skip_step6) ===", file=sys.stderr)
         print(f"\n[summary (partial)]")
         print(f"  H_before     = {H_before_bits:.6f} bits")
-        print(f"  rows removed = {len(remove_indices):,} / {total_rows:,} ({args.top_pct}%)")
+        print(f"  rows removed = {len(remove_indices):,} / {total_rows:,} ({removed_pct:.1f}%)")
+        if null_rows:
+            print(f"  null rows    = {null_rows:,} (not scored, kept)")
         print(f"  sum(selected ΔH_i) = {sum_selected_delta_bits:.6f} bits")
     else:
         # -------- 6. Verification: re-compute CE (cap workers to avoid OOM from accumulated memory through Step 5) --------
         step6_workers = min(n_workers, 20)
         print(f"\n=== Step 6/6: Recompute CE on filtered data (parallel scan, workers={step6_workers}) ===",
               file=sys.stderr)
-        filtered_counts, filtered_total_tokens, _ = build_train_counts_parallel(
+        filtered_counts, filtered_total_tokens, _, _ = build_train_counts_parallel(
             out_read_path, args.train_col, bench_vocab,
             n_workers=step6_workers, batch_size=args.batch_size,
             progress_name="train-scan(filtered)", progress_every=args.progress_every,
@@ -1236,7 +1471,9 @@ def main():
         print(f"  H_before     = {H_before_bits:.6f} bits")
         print(f"  H_after      = {H_after_bits:.6f} bits")
         print(f"  ΔH (actual)  = {H_after_bits - H_before_bits:.6f} bits")
-        print(f"  rows removed = {len(remove_indices):,} / {total_rows:,} ({args.top_pct}%)")
+        print(f"  rows removed = {len(remove_indices):,} / {total_rows:,} ({removed_pct:.1f}%)")
+        if null_rows:
+            print(f"  null rows    = {null_rows:,} (not scored, kept)")
         print("="*55)
         print(f"\n[check] sum(selected ΔH_i) = {sum_selected_delta_bits:.6f} bits "
               f"(may differ from actual ΔH due to row interactions)")
@@ -1250,10 +1487,11 @@ def main():
                                 every=max(1, args.progress_every // 20))
             seq_counts = train_counts.copy()
             seq_total = train_total_tokens
-            row_idx = 0
             removed_seen = 0
 
-            for text in iter_texts(args.train_path, args.train_col, args.batch_size, fmt=train_fmt):
+            # Same physical row numbering as scoring and the writer
+            for row_idx, text in iter_indexed_texts(args.train_path, args.train_col,
+                                                    args.batch_size, fmt=train_fmt):
                 if row_idx in remove_indices:
                     toks = tokenize(text)
                     seq_total -= len(toks)
@@ -1262,7 +1500,6 @@ def main():
                             seq_counts[w] -= 1
                     removed_seen += 1
                     prog_seq.update(1)
-                row_idx += 1
                 if removed_seen == len(remove_indices):
                     break
 
@@ -1272,8 +1509,11 @@ def main():
             print(f"[check] H_seq_apply - H_after = {H_seq_bits - H_after_bits:.6e} bits (should be ~0)")
 
             if removed_seen != len(remove_indices):
-                print(f"[warn] saw only {removed_seen}/{len(remove_indices)} removals; "
-                      f"row indexing mismatch possible.", file=sys.stderr)
+                _fail(f"seq-apply: saw only {removed_seen:,}/{len(remove_indices):,} removed rows "
+                      f"in {args.train_path}; row indexing mismatch")
+            if abs(H_seq_bits - H_after_bits) > 1e-9:
+                _fail(f"seq-apply: |H_seq_apply - H_after| = {abs(H_seq_bits - H_after_bits):.3e} bits "
+                      f"> 1e-9; the written output is not the corpus minus the selected rows")
 
     # -------- Done: clean up checkpoints --------
     _clean_ckpt(args.out_parquet)
@@ -1281,4 +1521,11 @@ def main():
 
 if __name__ == "__main__":
     mp.set_start_method("fork" if sys.platform == "linux" else "spawn", force=True)
-    main()
+    try:
+        main()
+    except (OSError, ValueError) as e:
+        # Unusable input (missing path, unreadable or non-parquet file, broken symlink,
+        # symlink loop): one line with the exception type and the first line of its message
+        # (pyarrow's messages name the file), exit code 1
+        lines = str(e).strip().splitlines()
+        _fail(f"{type(e).__name__}: {lines[0] if lines else ''}")
