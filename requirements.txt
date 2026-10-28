@@ -1,16 +1,10 @@
-# Top-level requirements for the supplementary code.
-# Each module also has its own narrower requirements file.
+# Top-level requirements.
 
-# --- core (used by all modules) ---
-numpy>=1.24
+# --- core (unigram_ce, ce_filter) ---
 pyarrow>=14
-
-# --- DSIR baseline ---
-mmh3>=4.0,<5
 
 # --- benchmark preprocessing ---
 datasets>=2.14
-huggingface_hub
 
 # --- CE filter (only when reading raw Common Crawl WET) ---
 warcio  # optional; only required if running ce_filter.py with --train_format wet
