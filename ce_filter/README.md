@@ -31,7 +31,8 @@ python benchmarks/preprocess_csr7.py \
 
 Its `benchmark_group_en/` directory then holds the 7 task files.
 Filter the corpus `/data/cc_dump/` against it. `--top_pct 80` removes
-the 80% of rows least aligned with Q and keeps 20%, the paper setting.
+the 80% of rows least aligned with Q and keeps 20%, the paper's setting
+for the comparison with other selection methods (§5.3).
 This example writes the kept rows as 12 shard files into
 `/data/ucef_keep20_shards/`:
 
@@ -74,8 +75,9 @@ line is printed to stderr.
 
 `--top_pct` is the percent of rows REMOVED. The removed rows are those
 with the smallest ΔH, so `--top_pct 80` removes 80% of the rows and
-keeps the 20% most aligned with Q. This is the paper setting and the
-default.
+keeps the 20% most aligned with Q. This is the default and the paper's
+setting in §5.3. §5.2 also keeps 40, 60 and 80% of each corpus
+(`--top_pct 60`, `40` and `20`).
 
 - K = `max(1, int(N_text * top_pct / 100))`, at most N_text, where
   N_text is the number of rows with non-null text. `--top_pct 0`
@@ -98,6 +100,10 @@ The summary prints the share actually removed, as
   at the cutoff, the row with the larger row index (later in the
   corpus) is removed first, so repeated runs write the same rows
   whatever the worker scheduling.
+- Runs that differ only in `--top_pct` score and order the rows the
+  same way, so their kept subsets are nested: the 20% subset lies
+  inside the 40% subset, and so on. This is the same as ranking the
+  rows once and cutting the ranking at several points, as §5.2 does.
 
 ## Errors
 

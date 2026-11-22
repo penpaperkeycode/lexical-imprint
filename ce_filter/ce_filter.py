@@ -1114,7 +1114,8 @@ def main():
     parser.add_argument("--top_pct",         type=float, default=80.0,
                         help="Percent of rows to REMOVE: the rows with the smallest ΔH (the least aligned "
                              "with Q); all other rows are written. Must be in [0, 100). "
-                             "Default 80 = the paper setting (removes 80%%, keeps 20%%).")
+                             "Default 80 = the paper's setting in Section 5.3 (removes 80%%, keeps 20%%); "
+                             "Section 5.2 also uses 60, 40 and 20.")
     parser.add_argument("--batch_size",      type=int,   default=8192)
     parser.add_argument("--worker_batch",    type=int,   default=1024,
                         help="Rows per scoring-worker batch (recommended: 1024-2048).")
