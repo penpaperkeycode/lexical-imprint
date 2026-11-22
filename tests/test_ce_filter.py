@@ -333,6 +333,31 @@ def test_ties_at_cutoff_are_broken_by_row_index(tmp_path):
     assert outputs[0] == outputs[1] == outputs[2] == want
 
 
+def test_kept_subsets_are_nested_across_top_pct(tmp_path):
+    """Section 5.2 ranks the rows once and keeps the top 20, 40, 60 or 80%. One run per --top_pct
+    writes the same subsets: each run cuts the one brute-force ranking, ties included, so a
+    smaller kept subset lies inside a larger one."""
+    rng = random.Random(9)
+    texts = random_texts(30, seed=8) + [f"j{i}a j{i}b j{i}c" for i in range(10)]  # junk rows: equal ΔH
+    rng.shuffle(texts)
+    bench = write_bench(tmp_path / "bench", {"a": BENCH_A, "b": BENCH_B})
+    corpus = write_corpus(tmp_path / "corpus", texts, n_files=3, row_group_size=4)
+    kept, orders = {}, []
+    for pct in (20, 40, 60, 80):
+        removed, _, order, _ = ref_removed(BENCH_A + BENCH_B, texts, pct)
+        orders.append(order)
+        out = tmp_path / f"out{pct}.parquet"
+        r = run_cli("--bench_path", bench, "--train_path", corpus, "--out_parquet", out,
+                    "--top_pct", str(pct), "--skip_step6", *WORKERS)
+        assert r.returncode == 0, r.stderr
+        kept[pct] = kept_rids(out)
+        assert kept[pct] == [i for i in range(len(texts)) if i not in removed]
+    assert all(o == orders[0] for o in orders)
+    assert len(kept[20]) > len(kept[40]) > len(kept[60]) > len(kept[80])
+    for larger, smaller in ((20, 40), (40, 60), (60, 80)):
+        assert set(kept[smaller]) <= set(kept[larger])
+
+
 # ------------------------------------------------------------------
 # Failures that used to pass silently
 # ------------------------------------------------------------------

@@ -13,12 +13,12 @@
 </p>
 
 <p align="center">
-  <img src="assets/teaser.png" width="92%" alt="Unigram cross-entropy at the corpus, document, and prompt scopes">
+  <img src="assets/teaser.png" width="92%" alt="The lexical imprint of pre-training data, and unigram cross-entropy at the corpus, document, and prompt levels">
 </p>
 
 This repository contains the code for the NeurIPS 2026 paper **The Lexical Imprint of Pre-training Data**.
 
-Word-level unigram cross-entropy (UCE) measures how closely the word distribution of a reference corpus matches that of a target benchmark. In controlled from-scratch pre-training on four corpora at three model scales, lower UCE goes with higher zero-shot accuracy on each of the 10 benchmarks in this sweep. Selecting training documents that lower UCE against a target (the UCE-filter) raises accuracy on that target above a random selection at the same token budget. Routing each prompt to the drafter whose training corpus has the lowest UCE against it raises speculative-decoding throughput.
+Word-level unigram cross-entropy (UCE) measures how closely the word distribution of a reference corpus matches that of a target benchmark. In controlled from-scratch pre-training on four corpora at three model scales, lower UCE goes with higher zero-shot accuracy on each of the 10 benchmarks in this sweep. The UCE-filter selects the training documents most aligned with a target. Within one corpus and at a fixed token budget, keeping a smaller share of the documents lowers the UCE of the kept subset against the target, and accuracy on the target rises as that UCE falls. Keeping 20% raises target accuracy above a random selection from the same corpus. Routing each prompt to the drafter whose training corpus has the lowest UCE against it raises speculative-decoding throughput.
 
 The repository provides the paper's components: the UCE metric, the UCE-filter, and the benchmark preprocessing that builds the target word distribution *Q*. Each comes with tests.
 
@@ -27,7 +27,7 @@ The repository provides the paper's components: the UCE metric, the UCE-filter, 
 | Path | What it does | Paper |
 |---|---|---|
 | [`unigram_ce/`](unigram_ce) | Word-level unigram cross-entropy between a pre-training corpus and one benchmark or a pooled group of benchmarks | §3, §4, App. A.1 |
-| [`ce_filter/`](ce_filter) | UCE-filter (named CE-filter in the code): analytic row-local ΔH scoring that removes the `--top_pct`% least-aligned rows (paper: 80, keeps 20%) | §5.1, §5.2 |
+| [`ce_filter/`](ce_filter) | UCE-filter (named CE-filter in the code): analytic row-local ΔH scoring that removes the `--top_pct`% least-aligned rows (§5.2 keeps 20, 40, 60 and 80%; §5.3 keeps 20%, `--top_pct 80`) | §5.1–§5.3 |
 | [`benchmarks/`](benchmarks) | Downloads the benchmark text that defines *Q*: the CSR7 targets and the four out-of-target tasks (no MMLU) | §4.1, §5.2 |
 | [`tests/`](tests) | pytest tests for the three components (no network needed) | |
 
@@ -64,7 +64,7 @@ python unigram_ce/compute_unigram_ce.py \
     --n_workers 64 --bits
 ```
 
-Run the UCE-filter against the pooled CSR7 target. `--top_pct 80` removes the 80% of rows least aligned with *Q* and keeps 20%, the paper setting:
+Run the UCE-filter against the pooled CSR7 target. `--top_pct 80` removes the 80% of rows least aligned with *Q* and keeps 20%, the setting that Section 5.3 compares with other selection methods:
 
 ```bash
 python ce_filter/ce_filter.py \
@@ -76,6 +76,8 @@ python ce_filter/ce_filter.py \
     --skip_seq_apply \
     --top_pct 80
 ```
+
+For the other kept shares of Section 5.2, run the same command with `--top_pct 60`, `40` or `20`, which keep 40, 60 or 80% of the rows.
 
 The first command writes `/data/csr7/<task>/<task>.parquet` for each task and the combined directory `/data/csr7/benchmark_group_en/` with the same seven files. A directory passed as `--bench_path` is pooled into one *Q*, weighted by word count, so the UCE-filter targets the seven tasks together. Pass the combined directory, not the output root.
 
@@ -100,7 +102,7 @@ This prints `H_after (recomputed)` in bits and does not need `--train_path`. Run
 
 where *V_b* is the benchmark vocabulary. Corpus counts of benchmark words that never occur in the corpus are floored at one: P(w) = max(c(w), 1) / (T + B), where T counts all word tokens of the corpus and B is the number of benchmark words with c(w) = 0 (Appendix A.1). Positive counts are unchanged, so this is not Laplace smoothing. Words come from NFKC normalization, punctuation stripping, and whitespace splitting, without lowercasing, as in the paper. The UCE script and the UCE-filter share this tokenizer, and `--lowercase` in `unigram_ce/compute_unigram_ce.py` lowercases words first (a preprocessing ablation in the paper's appendix). The paper reports bits. `compute_unigram_ce.py` prints nats and adds bits with `--bits`. `ce_filter.py` prints bits.
 
-**UCE-filter.** For each training row *r*, the change in UCE from removing *r* alone, ΔH(*r*), has a closed form that depends only on the words in *r* and the corpus counts. One pass counts the benchmark words in the corpus, and a second pass scores every row. The `--top_pct` percent of rows with the smallest ΔH, the rows whose removal lowers UCE the most, are then removed together. The remaining rows are the share most aligned with *Q* and are written in their original order. The paper removes 80% of the rows and keeps 20% (`--top_pct 80`, the default). Rows with null text are never scored and always kept. Ties at the cutoff are broken by row index, so the output is deterministic. In the paper's runs, with `--skip_seq_apply` on one 120-core machine, a selection took about 3.5 hours on the FineWeb-Edu pool and 8.3 hours on the DCLM pool. The removal set stays in memory. At `--top_pct 80` it takes about 44 GB of RAM for a 339M-row corpus (the paper's FineWeb-Edu pool) and about 82 GB for 630M rows (DCLM).
+**UCE-filter.** For each training row *r*, the change in UCE from removing *r* alone, ΔH(*r*), has a closed form that depends only on the words in *r* and the corpus counts. One pass counts the benchmark words in the corpus, and a second pass scores every row. The `--top_pct` percent of rows with the smallest ΔH, the rows whose removal lowers UCE the most, are then removed together. The remaining rows are the share most aligned with *Q* and are written in their original order. The default, `--top_pct 80`, removes 80% of the rows and keeps 20%, the setting of Section 5.3. Section 5.2 varies the kept share from 20% to 80%. Runs with different `--top_pct` score the rows identically and break ties the same way, so a smaller kept subset always lies inside a larger one, as if one ranking were cut at several points. Rows with null text are never scored and always kept. Ties at the cutoff are broken by row index, so the output is deterministic. In the paper's runs, with `--skip_seq_apply` on one 120-core machine, a selection took about 3.5 hours on the FineWeb-Edu pool and 8.3 hours on the DCLM pool. The removal set stays in memory. At `--top_pct 80` it takes about 44 GB of RAM for a 339M-row corpus (the paper's FineWeb-Edu pool) and about 82 GB for 630M rows (DCLM).
 
 **Benchmarks.** `benchmarks/preprocess_csr7.py` downloads the benchmarks of the UCE-filter study from the Hugging Face Hub. It writes one parquet file per task and a combined `benchmark_group_en/` directory that holds the tasks written by that run. The targeted group (CSR7) is ARC-Easy, ARC-Challenge, HellaSwag, SciQ, OpenBookQA, PIQA, and SWAG. The out-of-target group (OOT-4) is LAMBADA, CommonsenseQA, BoolQ, and Social IQA. Each row's text joins the raw dataset fields. For most tasks this is the question or context followed by all answer choices. SciQ adds the support passage, BoolQ is the passage and the question, and LAMBADA is the passage. HellaSwag and CommonsenseQA are read from their train and validation splits. The paper's *Q* also pooled their test splits, which moves UCE by 0.01 to 0.02 bits on our corpus samples. MMLU, which Section 4 also uses, is not included.
 
@@ -116,7 +118,7 @@ Not included:
 - the baseline selections (DSIR, BETR) and the random control
 - pre-training and evaluation (the paper's appendix gives the training and evaluation configuration)
 - the inference-time routing study (Section 6)
-- the 30B case study (Section 5.3)
+- the 30B case study (Section 5.4)
 - scripts for the appendix analyses (most of them combine the functions here)
 
 ## Testing
